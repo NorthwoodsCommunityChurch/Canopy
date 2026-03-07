@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# Release artifacts
+*.zip
+*.dmg
+*.app
+
+# SPM
+.build/
+.playwright-mcp/
+canopy_icon_html.html
