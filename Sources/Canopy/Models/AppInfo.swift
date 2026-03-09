@@ -53,6 +53,7 @@ struct CatalogApp: Identifiable {
     let info: AppInfo
     var latestRelease: AppRelease?
     var installState: InstallState
+    var installedAppName: String?  // Actual .app folder name (e.g. "Dashboard", "WhisperVerses")
 
     var id: String { info.id }
 }

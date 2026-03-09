@@ -17,8 +17,8 @@ struct CanopyApp: App {
         WindowGroup {
             ContentView()
         }
-        .windowStyle(.titleBar)
-        .defaultSize(width: 900, height: 640)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 960, height: 700)
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updaterController.updater)

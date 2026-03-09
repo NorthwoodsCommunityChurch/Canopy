@@ -50,7 +50,15 @@ final class CatalogViewModel {
             }
 
             // Check installed versions
-            let installed = await installer.findInstalledNorthwoodsApps()
+            let installedApps = await installer.findInstalledNorthwoodsApps()
+
+            // Match installed apps to catalog entries
+            for (index, app) in catalog.enumerated() {
+                if let match = findInstalledMatch(for: app.info, in: installedApps) {
+                    catalog[index].installState = .installed(version: match.version)
+                    catalog[index].installedAppName = match.folderName
+                }
+            }
 
             // Fetch releases and check updates in parallel
             await withTaskGroup(of: (Int, AppRelease?, AppcastItem?)?.self) { group in
@@ -69,14 +77,11 @@ final class CatalogViewModel {
                     guard let (index, release, appcastItem) = result else { continue }
                     catalog[index].latestRelease = release
 
-                    // Determine install state
-                    let appName = guessAppName(from: catalog[index].info)
-                    if let installedVersion = installed[appName] {
+                    // Check if update is available for installed apps
+                    if case .installed(let installedVersion) = catalog[index].installState {
                         let latestVersion = appcastItem?.shortVersionString ?? release?.version ?? installedVersion
                         if latestVersion != installedVersion {
                             catalog[index].installState = .updateAvailable(installed: installedVersion, latest: latestVersion)
-                        } else {
-                            catalog[index].installState = .installed(version: installedVersion)
                         }
                     }
                 }
@@ -131,14 +136,18 @@ final class CatalogViewModel {
             updateState(for: app.info.id, state: .installing)
 
             let appURL = try await installer.extractApp(zipURL: zipURL)
-            let appName = guessAppName(from: app.info)
-            try await installer.installApp(appURL: appURL, appName: appName)
+            // Use the actual .app name from the extracted bundle
+            let extractedAppName = appURL.deletingPathExtension().lastPathComponent
+            try await installer.installApp(appURL: appURL, appName: extractedAppName)
 
             // Clean up temp files
             await installer.cleanup(tempURL: zipURL)
 
-            // Check installed version
-            let version = await installer.installedVersion(appName: appName) ?? release.version
+            // Store the real app name and check installed version
+            if let index = apps.firstIndex(where: { $0.info.id == app.info.id }) {
+                apps[index].installedAppName = extractedAppName
+            }
+            let version = await installer.installedVersion(appName: extractedAppName) ?? release.version
             updateState(for: app.info.id, state: .installed(version: version))
         } catch {
             updateState(for: app.info.id, state: .error(error.localizedDescription))
@@ -147,14 +156,14 @@ final class CatalogViewModel {
 
     /// Open an installed app
     func openApp(_ app: CatalogApp) {
-        let appName = guessAppName(from: app.info)
+        guard let appName = app.installedAppName else { return }
         let appPath = "/Applications/\(appName).app"
         NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
     }
 
     /// Uninstall an app
     func uninstallApp(_ app: CatalogApp) async {
-        let appName = guessAppName(from: app.info)
+        guard let appName = app.installedAppName else { return }
         let appPath = "/Applications/\(appName).app"
 
         // Quit if running
@@ -180,10 +189,36 @@ final class CatalogViewModel {
         }
     }
 
-    /// Guess the .app name from repo info
-    /// e.g. "avl-computer-dashboard" -> "Computer Dashboard"
-    /// This matches what the build script names the .app bundle
-    private func guessAppName(from info: AppInfo) -> String {
-        info.displayName
+    /// Match a repo to an installed app using normalized name comparison
+    /// Repo names like "avl-computer-dashboard" need to match app folders like "Dashboard"
+    private func findInstalledMatch(for info: AppInfo, in installed: [InstallService.InstalledApp]) -> InstallService.InstalledApp? {
+        let repoNormalized = normalize(info.id)
+
+        for app in installed {
+            let folderNormalized = normalize(app.folderName)
+            let bundleNormalized = normalize(app.bundleID)
+
+            // Exact normalized match
+            if repoNormalized == folderNormalized { return app }
+
+            // Repo name contains the app folder name or vice versa
+            if repoNormalized.contains(folderNormalized) || folderNormalized.contains(repoNormalized) { return app }
+
+            // Bundle ID contains the repo name (minus "avl-" prefix)
+            let repoBase = info.id.replacingOccurrences(of: "avl-", with: "")
+            let baseNormalized = normalize(repoBase)
+            if bundleNormalized.contains(baseNormalized) || baseNormalized.contains(folderNormalized) { return app }
+        }
+
+        return nil
+    }
+
+    /// Normalize a string for fuzzy matching: lowercase, remove separators
+    private func normalize(_ string: String) -> String {
+        string.lowercased()
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: ".", with: "")
     }
 }

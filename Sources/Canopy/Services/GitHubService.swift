@@ -25,7 +25,8 @@ actor GitHubService {
 
         let searchResult = try JSONDecoder().decode(GitHubSearchResult.self, from: data)
 
-        return searchResult.items.map { repo in
+        let excludedRepos: Set<String> = ["Canopy", "avl-media-indexer"]
+        return searchResult.items.filter { !excludedRepos.contains($0.name) }.map { repo in
             let appcastName = appcastFileName(for: repo.name)
             let appcastURL = URL(string: "https://northwoodscommunitychurch.github.io/app-updates/\(appcastName)")
 

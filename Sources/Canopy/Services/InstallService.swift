@@ -116,9 +116,24 @@ actor InstallService {
         return plist["CFBundleVersion"] as? String
     }
 
+    /// Represents an installed app found in /Applications
+    struct InstalledApp {
+        let folderName: String    // e.g. "WhisperVerses", "Limbus Live", "Dashboard"
+        let bundleID: String
+        let version: String
+    }
+
     /// Find all Northwoods apps currently installed in /Applications
-    func findInstalledNorthwoodsApps() -> [String: String] {
-        var installed: [String: String] = [:]
+    /// Matches by bundle ID prefixes known to be used by Northwoods apps
+    func findInstalledNorthwoodsApps() -> [InstalledApp] {
+        let knownPrefixes = [
+            "org.northwoodschurch.",
+            "com.northwoodschurch.",
+            "com.northwoods.",
+            "com.computerdash.",
+        ]
+
+        var installed: [InstalledApp] = []
 
         guard let apps = try? fileManager.contentsOfDirectory(atPath: applicationsPath) else {
             return installed
@@ -129,13 +144,13 @@ actor InstallService {
             guard let plistData = fileManager.contents(atPath: plistPath),
                   let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
                   let bundleID = plist["CFBundleIdentifier"] as? String,
-                  bundleID.hasPrefix("org.northwoodschurch.") else {
+                  knownPrefixes.contains(where: { bundleID.hasPrefix($0) }) else {
                 continue
             }
 
             let version = plist["CFBundleShortVersionString"] as? String ?? "unknown"
-            let appName = appFolder.replacingOccurrences(of: ".app", with: "")
-            installed[appName] = version
+            let folderName = appFolder.replacingOccurrences(of: ".app", with: "")
+            installed.append(InstalledApp(folderName: folderName, bundleID: bundleID, version: version))
         }
 
         return installed
