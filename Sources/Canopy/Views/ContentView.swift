@@ -154,7 +154,7 @@ struct ContentView: View {
 
             // Refresh button
             Button {
-                Task { await viewModel.loadCatalog() }
+                Task { await viewModel.loadCatalog(forceRefresh: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 12, weight: .medium))

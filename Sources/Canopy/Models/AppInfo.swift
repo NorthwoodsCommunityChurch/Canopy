@@ -1,7 +1,7 @@
 import Foundation
 
 /// Represents a Northwoods app available in Canopy
-struct AppInfo: Identifiable, Hashable {
+struct AppInfo: Identifiable, Hashable, Codable {
     let id: String              // GitHub repo name (e.g. "avl-computer-dashboard")
     let name: String            // Display name (e.g. "Computer Dashboard")
     let description: String     // Repo description from GitHub
@@ -10,15 +10,19 @@ struct AppInfo: Identifiable, Hashable {
 
     var displayName: String {
         // Convert repo name to display name: "avl-computer-dashboard" -> "Computer Dashboard"
+        // All-uppercase segments (like "MIDI") are preserved as-is
         name.replacingOccurrences(of: "avl-", with: "")
             .split(separator: "-")
-            .map { $0.capitalized }
+            .map { segment in
+                let s = String(segment)
+                return s == s.uppercased() && s.count > 1 ? s : s.capitalized
+            }
             .joined(separator: " ")
     }
 }
 
 /// Represents a specific release/version of an app
-struct AppRelease: Identifiable {
+struct AppRelease: Identifiable, Codable {
     let id: String              // Tag name (e.g. "v1.0.5")
     let version: String         // Marketing version
     let buildNumber: String?    // Build number from appcast

@@ -2,6 +2,36 @@ import Foundation
 import SwiftUI
 import AppKit
 
+// MARK: - Catalog Cache
+
+private struct CachedCatalog: Codable {
+    let fetchedAt: Date
+    let apps: [AppInfo]
+    let releases: [String: AppRelease]  // keyed by app id
+}
+
+private let cacheURL: URL = {
+    let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    return support.appendingPathComponent("Canopy/catalog-cache.json")
+}()
+
+private let cacheTTL: TimeInterval = 30 * 60  // 30 minutes
+
+private func loadCache() -> CachedCatalog? {
+    guard let data = try? Data(contentsOf: cacheURL),
+          let cache = try? JSONDecoder().decode(CachedCatalog.self, from: data),
+          Date().timeIntervalSince(cache.fetchedAt) < cacheTTL else { return nil }
+    return cache
+}
+
+private func saveCache(_ cache: CachedCatalog) {
+    guard let data = try? JSONEncoder().encode(cache) else { return }
+    try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: cacheURL)
+}
+
+// MARK: - CatalogViewModel
+
 @Observable
 final class CatalogViewModel {
     var apps: [CatalogApp] = []
@@ -37,52 +67,32 @@ final class CatalogViewModel {
     }
 
     /// Load the full catalog: fetch repos, check installed versions, check for updates
-    func loadCatalog() async {
+    /// Pass forceRefresh: true to bypass the cache (e.g. from the refresh button)
+    func loadCatalog(forceRefresh: Bool = false) async {
         isLoading = true
         errorMessage = nil
 
         do {
-            let repoInfos = try await github.fetchAppRepos()
+            // Resolve repo infos + releases (from cache or GitHub)
+            let (repoInfos, cachedReleases) = try await fetchCatalogData(forceRefresh: forceRefresh)
 
             // Initialize catalog with repos
             var catalog: [CatalogApp] = repoInfos.map { info in
-                CatalogApp(info: info, latestRelease: nil, installState: .notInstalled)
+                CatalogApp(info: info, latestRelease: cachedReleases[info.id], installState: .notInstalled)
             }
 
             // Check installed versions
             let installedApps = await installer.findInstalledNorthwoodsApps()
 
-            // Match installed apps to catalog entries
+            // Match installed apps to catalog entries and check updates
             for (index, app) in catalog.enumerated() {
                 if let match = findInstalledMatch(for: app.info, in: installedApps) {
-                    catalog[index].installState = .installed(version: match.version)
                     catalog[index].installedAppName = match.folderName
-                }
-            }
-
-            // Fetch releases and check updates in parallel
-            await withTaskGroup(of: (Int, AppRelease?, AppcastItem?)?.self) { group in
-                for (index, app) in catalog.enumerated() {
-                    group.addTask { [github, appcast] in
-                        let release = try? await github.fetchLatestRelease(repoName: app.info.id)
-                        var appcastItem: AppcastItem?
-                        if let appcastURL = app.info.appcastURL {
-                            appcastItem = try? await appcast.checkForUpdate(appcastURL: appcastURL)
-                        }
-                        return (index, release, appcastItem)
-                    }
-                }
-
-                for await result in group {
-                    guard let (index, release, appcastItem) = result else { continue }
-                    catalog[index].latestRelease = release
-
-                    // Check if update is available for installed apps
-                    if case .installed(let installedVersion) = catalog[index].installState {
-                        let latestVersion = appcastItem?.shortVersionString ?? release?.version ?? installedVersion
-                        if latestVersion != installedVersion {
-                            catalog[index].installState = .updateAvailable(installed: installedVersion, latest: latestVersion)
-                        }
+                    let installedVersion = match.version
+                    if let release = catalog[index].latestRelease, release.version != installedVersion {
+                        catalog[index].installState = .updateAvailable(installed: installedVersion, latest: release.version)
+                    } else {
+                        catalog[index].installState = .installed(version: installedVersion)
                     }
                 }
             }
@@ -99,12 +109,58 @@ final class CatalogViewModel {
         }
     }
 
+    /// Fetch repo list and releases, using cache when available
+    private func fetchCatalogData(forceRefresh: Bool) async throws -> ([AppInfo], [String: AppRelease]) {
+        if !forceRefresh, let cache = loadCache() {
+            return (cache.apps, cache.releases)
+        }
+
+        let repoInfos = try await github.fetchAppRepos()
+        var releases: [String: AppRelease] = [:]
+
+        // Fetch releases and appcast updates in parallel
+        await withTaskGroup(of: (String, AppRelease?, AppcastItem?)?.self) { group in
+            for app in repoInfos {
+                group.addTask { [github, appcast] in
+                    let release = try? await github.fetchLatestRelease(repoName: app.id)
+                    var appcastItem: AppcastItem?
+                    if let appcastURL = app.appcastURL {
+                        appcastItem = try? await appcast.checkForUpdate(appcastURL: appcastURL)
+                    }
+                    // Prefer appcast version for the display version if available
+                    if let item = appcastItem, let release = release {
+                        let updatedRelease = AppRelease(
+                            id: release.id,
+                            version: item.shortVersionString ?? release.version,
+                            buildNumber: item.version,
+                            downloadURL: release.downloadURL,
+                            fileSize: release.fileSize,
+                            publishedAt: release.publishedAt,
+                            releaseNotes: release.releaseNotes,
+                            isPrerelease: release.isPrerelease
+                        )
+                        return (app.id, updatedRelease, appcastItem)
+                    }
+                    return (app.id, release, appcastItem)
+                }
+            }
+
+            for await result in group {
+                guard let (id, release, _) = result else { continue }
+                releases[id] = release
+            }
+        }
+
+        saveCache(CachedCatalog(fetchedAt: Date(), apps: repoInfos, releases: releases))
+        return (repoInfos, releases)
+    }
+
     /// Load icons for all apps in the catalog
     func loadIcons() async {
         await withTaskGroup(of: (String, NSImage?).self) { group in
             for app in apps {
                 group.addTask { [iconService] in
-                    let image = await iconService.icon(for: app.info)
+                    let image = await iconService.icon(for: app.info, installedAppName: app.installedAppName)
                     return (app.info.id, image)
                 }
             }
@@ -154,17 +210,30 @@ final class CatalogViewModel {
         }
     }
 
+    /// Find the actual path of an installed app (checks Northwoods folder first, then legacy /Applications)
+    private func installedAppPath(appName: String) -> String? {
+        let northwoodsPath = "/Applications/Canopy/\(appName).app"
+        if FileManager.default.fileExists(atPath: northwoodsPath) {
+            return northwoodsPath
+        }
+        let legacyPath = "/Applications/\(appName).app"
+        if FileManager.default.fileExists(atPath: legacyPath) {
+            return legacyPath
+        }
+        return nil
+    }
+
     /// Open an installed app
     func openApp(_ app: CatalogApp) {
-        guard let appName = app.installedAppName else { return }
-        let appPath = "/Applications/\(appName).app"
+        guard let appName = app.installedAppName,
+              let appPath = installedAppPath(appName: appName) else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: appPath))
     }
 
     /// Uninstall an app
     func uninstallApp(_ app: CatalogApp) async {
-        guard let appName = app.installedAppName else { return }
-        let appPath = "/Applications/\(appName).app"
+        guard let appName = app.installedAppName,
+              let appPath = installedAppPath(appName: appName) else { return }
 
         // Quit if running
         let runningApps = NSWorkspace.shared.runningApplications

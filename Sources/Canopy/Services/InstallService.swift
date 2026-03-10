@@ -1,10 +1,11 @@
 import Foundation
 import AppKit
 
-/// Handles downloading, extracting, and installing apps to /Applications
+/// Handles downloading, extracting, and installing apps to /Applications/Northwoods
 actor InstallService {
     private let fileManager = FileManager.default
-    private let applicationsPath = "/Applications"
+    private let applicationsPath = "/Applications/Canopy"
+    private let legacyApplicationsPath = "/Applications"
 
     /// Download a zip from a URL with progress reporting
     func downloadApp(from url: URL, progressHandler: @escaping @Sendable (Double) -> Void) async throws -> URL {
@@ -67,16 +68,25 @@ actor InstallService {
         return appBundle
     }
 
-    /// Install an app to /Applications, replacing existing version if present
+    /// Install an app to /Applications/Northwoods, replacing existing version if present
     func installApp(appURL: URL, appName: String) async throws {
+        // Create /Applications/Northwoods if it doesn't exist
+        if !fileManager.fileExists(atPath: applicationsPath) {
+            try fileManager.createDirectory(atPath: applicationsPath, withIntermediateDirectories: true)
+        }
+
         let destURL = URL(fileURLWithPath: applicationsPath).appendingPathComponent("\(appName).app")
 
         // Quit the app if it's running
         await quitApp(named: appName)
 
-        // Remove existing version
+        // Remove existing version (check both Northwoods and legacy /Applications)
         if fileManager.fileExists(atPath: destURL.path) {
             try fileManager.removeItem(at: destURL)
+        }
+        let legacyURL = URL(fileURLWithPath: legacyApplicationsPath).appendingPathComponent("\(appName).app")
+        if fileManager.fileExists(atPath: legacyURL.path) {
+            try fileManager.removeItem(at: legacyURL)
         }
 
         // Clear quarantine attributes from the extracted app
@@ -86,13 +96,26 @@ actor InstallService {
         try xattrProcess.run()
         xattrProcess.waitUntilExit()
 
-        // Move to /Applications
+        // Move to /Applications/Northwoods
         try fileManager.moveItem(at: appURL, to: destURL)
     }
 
-    /// Check what version of an app is installed in /Applications
+    /// Find the actual path where an app is installed (Northwoods folder or legacy /Applications)
+    private func installedAppPath(appName: String) -> URL? {
+        let northwoodsPath = URL(fileURLWithPath: applicationsPath).appendingPathComponent("\(appName).app")
+        if fileManager.fileExists(atPath: northwoodsPath.path) {
+            return northwoodsPath
+        }
+        let legacyPath = URL(fileURLWithPath: legacyApplicationsPath).appendingPathComponent("\(appName).app")
+        if fileManager.fileExists(atPath: legacyPath.path) {
+            return legacyPath
+        }
+        return nil
+    }
+
+    /// Check what version of an app is installed
     func installedVersion(appName: String) -> String? {
-        let appPath = URL(fileURLWithPath: applicationsPath).appendingPathComponent("\(appName).app")
+        guard let appPath = installedAppPath(appName: appName) else { return nil }
         let plistPath = appPath.appendingPathComponent("Contents/Info.plist")
 
         guard let plistData = fileManager.contents(atPath: plistPath.path),
@@ -105,7 +128,7 @@ actor InstallService {
 
     /// Get the build number of an installed app
     func installedBuildNumber(appName: String) -> String? {
-        let appPath = URL(fileURLWithPath: applicationsPath).appendingPathComponent("\(appName).app")
+        guard let appPath = installedAppPath(appName: appName) else { return nil }
         let plistPath = appPath.appendingPathComponent("Contents/Info.plist")
 
         guard let plistData = fileManager.contents(atPath: plistPath.path),
@@ -123,34 +146,41 @@ actor InstallService {
         let version: String
     }
 
-    /// Find all Northwoods apps currently installed in /Applications
+    /// Find all Northwoods apps currently installed (checks both /Applications/Northwoods and /Applications)
     /// Matches by bundle ID prefixes known to be used by Northwoods apps
     func findInstalledNorthwoodsApps() -> [InstalledApp] {
         let knownPrefixes = [
             "org.northwoodschurch.",
+            "org.northwoodscc.",
             "com.northwoodschurch.",
             "com.northwoods.",
             "com.computerdash.",
         ]
 
         var installed: [InstalledApp] = []
+        var seenBundleIDs: Set<String> = []
 
-        guard let apps = try? fileManager.contentsOfDirectory(atPath: applicationsPath) else {
-            return installed
-        }
-
-        for appFolder in apps where appFolder.hasSuffix(".app") {
-            let plistPath = "\(applicationsPath)/\(appFolder)/Contents/Info.plist"
-            guard let plistData = fileManager.contents(atPath: plistPath),
-                  let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
-                  let bundleID = plist["CFBundleIdentifier"] as? String,
-                  knownPrefixes.contains(where: { bundleID.hasPrefix($0) }) else {
+        // Scan both Northwoods folder and legacy /Applications
+        for searchPath in [applicationsPath, legacyApplicationsPath] {
+            guard let apps = try? fileManager.contentsOfDirectory(atPath: searchPath) else {
                 continue
             }
 
-            let version = plist["CFBundleShortVersionString"] as? String ?? "unknown"
-            let folderName = appFolder.replacingOccurrences(of: ".app", with: "")
-            installed.append(InstalledApp(folderName: folderName, bundleID: bundleID, version: version))
+            for appFolder in apps where appFolder.hasSuffix(".app") {
+                let plistPath = "\(searchPath)/\(appFolder)/Contents/Info.plist"
+                guard let plistData = fileManager.contents(atPath: plistPath),
+                      let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
+                      let bundleID = plist["CFBundleIdentifier"] as? String,
+                      knownPrefixes.contains(where: { bundleID.hasPrefix($0) }),
+                      !seenBundleIDs.contains(bundleID) else {
+                    continue
+                }
+
+                seenBundleIDs.insert(bundleID)
+                let version = plist["CFBundleShortVersionString"] as? String ?? "unknown"
+                let folderName = appFolder.replacingOccurrences(of: ".app", with: "")
+                installed.append(InstalledApp(folderName: folderName, bundleID: bundleID, version: version))
+            }
         }
 
         return installed

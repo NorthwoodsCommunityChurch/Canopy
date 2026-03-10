@@ -44,7 +44,10 @@ struct AppCardView: View {
                 Image(nsImage: nsImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
             } else {
+                // Fallback — branded gradient with first letter
                 ZStack {
                     RoundedRectangle(cornerRadius: 14)
                         .fill(
@@ -63,10 +66,9 @@ struct AppCardView: View {
                     RoundedRectangle(cornerRadius: 14)
                         .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
                 )
+                .frame(width: 48, height: 48)
             }
         }
-        .frame(width: 48, height: 48)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
     // MARK: - Version Text

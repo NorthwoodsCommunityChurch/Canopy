@@ -14,19 +14,35 @@ actor GitHubService {
         self.session = URLSession(configuration: config)
     }
 
-    /// Fetch all repos with avl-tools or lighting-tools topic
+    /// Fetch all repos with avl-tools topic
+    /// Uses the org repos endpoint (paginated) instead of the search API,
+    /// because the search index can miss repos.
     func fetchAppRepos() async throws -> [AppInfo] {
-        let url = URL(string: "https://api.github.com/search/repositories?q=org:\(org)+topic:avl-tools&per_page=100")!
-        let (data, response) = try await session.data(from: url)
+        var allRepos: [GitHubRepo] = []
+        var page = 1
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw CanopyError.githubAPIError("Failed to fetch repos")
+        while true {
+            let url = URL(string: "https://api.github.com/orgs/\(org)/repos?per_page=100&page=\(page)")!
+            let (data, response) = try await session.data(from: url)
+
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                throw CanopyError.githubAPIError("Failed to fetch repos")
+            }
+
+            let repos = try JSONDecoder().decode([GitHubRepo].self, from: data)
+            if repos.isEmpty { break }
+            allRepos.append(contentsOf: repos)
+            if repos.count < 100 { break }
+            page += 1
         }
 
-        let searchResult = try JSONDecoder().decode(GitHubSearchResult.self, from: data)
+        // Filter to repos that have the avl-tools topic
+        let avlRepos = allRepos.filter { repo in
+            repo.topics?.contains("avl-tools") == true
+        }
 
-        let excludedRepos: Set<String> = ["Canopy", "avl-media-indexer"]
-        return searchResult.items.filter { !excludedRepos.contains($0.name) }.map { repo in
+        let excludedRepos: Set<String> = ["Canopy", "avl-media-indexer", "Production-Positions"]
+        var apps = avlRepos.filter { !excludedRepos.contains($0.name) }.map { repo in
             let appcastName = appcastFileName(for: repo.name)
             let appcastURL = URL(string: "https://northwoodscommunitychurch.github.io/app-updates/\(appcastName)")
 
@@ -38,32 +54,65 @@ actor GitHubService {
                 appcastURL: appcastURL
             )
         }
+
+        // Add Vocalist Positions — lives in Production-Positions repo alongside Camera Positions
+        if let prodRepo = avlRepos.first(where: { $0.name == "Production-Positions" }) {
+            apps.append(AppInfo(
+                id: "vocalist-positions",
+                name: "Vocalist Positions",
+                description: "Vocalist position assignment display for live production teams",
+                repoURL: prodRepo.htmlURL,
+                appcastURL: nil
+            ))
+        }
+
+        return apps
+    }
+
+    /// Maps virtual app IDs to their actual repo name and asset prefix
+    private static let multiAppRepos: [String: (repo: String, assetPrefix: String)] = [
+        "vocalist-positions": (repo: "Production-Positions", assetPrefix: "VocalistPositions"),
+    ]
+
+    /// Resolve the actual GitHub repo name for an app ID
+    private func resolveRepo(_ repoName: String) -> String {
+        Self.multiAppRepos[repoName]?.repo ?? repoName
+    }
+
+    /// Resolve the asset prefix filter for an app ID (nil means no filter)
+    private func assetPrefix(_ repoName: String) -> String? {
+        Self.multiAppRepos[repoName]?.assetPrefix
     }
 
     /// Fetch the latest release for a repo
     func fetchLatestRelease(repoName: String) async throws -> AppRelease? {
-        let url = URL(string: "https://api.github.com/repos/\(org)/\(repoName)/releases/latest")!
+        let actualRepo = resolveRepo(repoName)
+        let prefix = assetPrefix(repoName)
+        let url = URL(string: "https://api.github.com/repos/\(org)/\(actualRepo)/releases/latest")!
         let (data, response) = try await session.data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             return nil
         }
 
-        if httpResponse.statusCode == 404 {
-            return nil // No releases yet
+        if httpResponse.statusCode == 200 {
+            let release = try JSONDecoder.githubDecoder.decode(GitHubRelease.self, from: data)
+            if let mapped = mapRelease(release, assetPrefix: prefix) {
+                return mapped
+            }
         }
 
-        guard httpResponse.statusCode == 200 else {
-            throw CanopyError.githubAPIError("Failed to fetch release for \(repoName)")
-        }
-
-        let release = try JSONDecoder.githubDecoder.decode(GitHubRelease.self, from: data)
-        return mapRelease(release)
+        // /releases/latest returned 404 (pre-release only) or release had no zip asset
+        // Fall back to fetching all releases and pick the first usable one
+        let allReleases = try await fetchReleases(repoName: repoName)
+        return allReleases.first
     }
 
     /// Fetch all releases for a repo
     func fetchReleases(repoName: String) async throws -> [AppRelease] {
-        let url = URL(string: "https://api.github.com/repos/\(org)/\(repoName)/releases?per_page=10")!
+        let actualRepo = resolveRepo(repoName)
+        let prefix = assetPrefix(repoName)
+        let url = URL(string: "https://api.github.com/repos/\(org)/\(actualRepo)/releases?per_page=10")!
         let (data, response) = try await session.data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
@@ -71,13 +120,20 @@ actor GitHubService {
         }
 
         let releases = try JSONDecoder.githubDecoder.decode([GitHubRelease].self, from: data)
-        return releases.compactMap { mapRelease($0) }
+        return releases.compactMap { mapRelease($0, assetPrefix: prefix) }
     }
 
-    private func mapRelease(_ release: GitHubRelease) -> AppRelease? {
-        // Find the zip asset (prefer aarch64)
-        let zipAsset = release.assets.first { $0.name.hasSuffix("-aarch64.zip") }
-            ?? release.assets.first { $0.name.hasSuffix(".zip") }
+    private func mapRelease(_ release: GitHubRelease, assetPrefix: String? = nil) -> AppRelease? {
+        // Find the zip asset (prefer aarch64), optionally filtered by prefix
+        let candidates = release.assets.filter { asset in
+            guard asset.name.hasSuffix(".zip") else { return false }
+            if let prefix = assetPrefix {
+                return asset.name.hasPrefix(prefix)
+            }
+            return true
+        }
+        let zipAsset = candidates.first { $0.name.hasSuffix("-aarch64.zip") }
+            ?? candidates.first
 
         guard let asset = zipAsset else { return nil }
 
@@ -110,25 +166,17 @@ actor GitHubService {
 
 // MARK: - GitHub API Models
 
-private struct GitHubSearchResult: Decodable {
-    let totalCount: Int
-    let items: [GitHubRepo]
-
-    enum CodingKeys: String, CodingKey {
-        case totalCount = "total_count"
-        case items
-    }
-}
-
 private struct GitHubRepo: Decodable {
     let name: String
     let description: String?
     let htmlURL: URL
+    let topics: [String]?
 
     enum CodingKeys: String, CodingKey {
         case name
         case description
         case htmlURL = "html_url"
+        case topics
     }
 }
 
