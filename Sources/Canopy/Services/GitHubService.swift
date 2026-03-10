@@ -41,7 +41,7 @@ actor GitHubService {
             repo.topics?.contains("avl-tools") == true
         }
 
-        let excludedRepos: Set<String> = ["Canopy", "avl-media-indexer", "Production-Positions"]
+        let excludedRepos: Set<String> = ["Canopy", "avl-media-indexer", "Production-Positions", "AVL-Dashboard"]
         var apps = avlRepos.filter { !excludedRepos.contains($0.name) }.map { repo in
             let appcastName = appcastFileName(for: repo.name)
             let appcastURL = URL(string: "https://northwoodscommunitychurch.github.io/app-updates/\(appcastName)")
@@ -66,12 +66,32 @@ actor GitHubService {
             ))
         }
 
+        // Add Dashboard and Dashboard Agent — both live in AVL-Dashboard repo
+        if let dashRepo = avlRepos.first(where: { $0.name == "AVL-Dashboard" }) {
+            apps.append(AppInfo(
+                id: "dashboard",
+                name: "AVL Dashboard",
+                description: dashRepo.description ?? "macOS system monitoring dashboard for AVL computers",
+                repoURL: dashRepo.htmlURL,
+                appcastURL: URL(string: "https://northwoodscommunitychurch.github.io/app-updates/appcast-dashboard.xml")
+            ))
+            apps.append(AppInfo(
+                id: "dashboard-agent",
+                name: "Dashboard Agent",
+                description: "Background agent that reports system stats to AVL Dashboard",
+                repoURL: dashRepo.htmlURL,
+                appcastURL: URL(string: "https://northwoodscommunitychurch.github.io/app-updates/appcast-dashboardagent.xml")
+            ))
+        }
+
         return apps
     }
 
     /// Maps virtual app IDs to their actual repo name and asset prefix
     private static let multiAppRepos: [String: (repo: String, assetPrefix: String)] = [
         "vocalist-positions": (repo: "Production-Positions", assetPrefix: "VocalistPositions"),
+        "dashboard": (repo: "AVL-Dashboard", assetPrefix: "Dashboard-v"),
+        "dashboard-agent": (repo: "AVL-Dashboard", assetPrefix: "DashboardAgent-v"),
     ]
 
     /// Resolve the actual GitHub repo name for an app ID

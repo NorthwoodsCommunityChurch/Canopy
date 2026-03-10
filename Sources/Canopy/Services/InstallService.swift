@@ -68,11 +68,16 @@ actor InstallService {
         return appBundle
     }
 
-    /// Install an app to /Applications/Northwoods, replacing existing version if present
+    /// Install an app to /Applications/Canopy, replacing existing version if present
     func installApp(appURL: URL, appName: String) async throws {
-        // Create /Applications/Northwoods if it doesn't exist
+        // Create /Applications/Canopy if it doesn't exist (may need admin privileges)
         if !fileManager.fileExists(atPath: applicationsPath) {
-            try fileManager.createDirectory(atPath: applicationsPath, withIntermediateDirectories: true)
+            do {
+                try fileManager.createDirectory(atPath: applicationsPath, withIntermediateDirectories: true)
+            } catch {
+                // FileManager failed (permission denied) — use osascript for admin privileges
+                try createDirectoryPrivileged(applicationsPath)
+            }
         }
 
         let destURL = URL(fileURLWithPath: applicationsPath).appendingPathComponent("\(appName).app")
@@ -80,14 +85,10 @@ actor InstallService {
         // Quit the app if it's running
         await quitApp(named: appName)
 
-        // Remove existing version (check both Northwoods and legacy /Applications)
-        if fileManager.fileExists(atPath: destURL.path) {
-            try fileManager.removeItem(at: destURL)
-        }
+        // Remove existing version (check both Canopy and legacy /Applications)
+        try removeIfExists(destURL.path)
         let legacyURL = URL(fileURLWithPath: legacyApplicationsPath).appendingPathComponent("\(appName).app")
-        if fileManager.fileExists(atPath: legacyURL.path) {
-            try fileManager.removeItem(at: legacyURL)
-        }
+        try removeIfExists(legacyURL.path)
 
         // Clear quarantine attributes from the extracted app
         let xattrProcess = Process()
@@ -96,8 +97,62 @@ actor InstallService {
         try xattrProcess.run()
         xattrProcess.waitUntilExit()
 
-        // Move to /Applications/Northwoods
-        try fileManager.moveItem(at: appURL, to: destURL)
+        // Move to /Applications/Canopy
+        do {
+            try fileManager.moveItem(at: appURL, to: destURL)
+        } catch {
+            // Move failed (permission denied) — use osascript for admin privileges
+            try copyPrivileged(from: appURL.path, to: destURL.path)
+            try? fileManager.removeItem(at: appURL)
+        }
+    }
+
+    /// Create a directory with admin privileges via osascript
+    private func createDirectoryPrivileged(_ path: String) throws {
+        let escaped = path.replacingOccurrences(of: "'", with: "'\\''")
+        let script = "do shell script \"mkdir -p '\(escaped)'\" with administrator privileges"
+        guard let appleScript = NSAppleScript(source: script) else {
+            throw CanopyError.installFailed("Failed to create admin script")
+        }
+        var error: NSDictionary?
+        appleScript.executeAndReturnError(&error)
+        if let error = error {
+            throw CanopyError.installFailed("Failed to create directory: \(error)")
+        }
+    }
+
+    /// Copy an app bundle with admin privileges via osascript
+    private func copyPrivileged(from source: String, to dest: String) throws {
+        let srcEscaped = source.replacingOccurrences(of: "'", with: "'\\''")
+        let dstEscaped = dest.replacingOccurrences(of: "'", with: "'\\''")
+        let script = "do shell script \"cp -R '\(srcEscaped)' '\(dstEscaped)'\" with administrator privileges"
+        guard let appleScript = NSAppleScript(source: script) else {
+            throw CanopyError.installFailed("Failed to create admin script")
+        }
+        var error: NSDictionary?
+        appleScript.executeAndReturnError(&error)
+        if let error = error {
+            throw CanopyError.installFailed("Failed to install app: \(error)")
+        }
+    }
+
+    /// Remove a file/directory, using admin privileges if needed
+    private func removeIfExists(_ path: String) throws {
+        guard fileManager.fileExists(atPath: path) else { return }
+        do {
+            try fileManager.removeItem(atPath: path)
+        } catch {
+            let escaped = path.replacingOccurrences(of: "'", with: "'\\''")
+            let script = "do shell script \"rm -rf '\(escaped)'\" with administrator privileges"
+            guard let appleScript = NSAppleScript(source: script) else {
+                throw CanopyError.installFailed("Failed to create admin script")
+            }
+            var scriptError: NSDictionary?
+            appleScript.executeAndReturnError(&scriptError)
+            if let scriptError = scriptError {
+                throw CanopyError.installFailed("Failed to remove existing app: \(scriptError)")
+            }
+        }
     }
 
     /// Find the actual path where an app is installed (Northwoods folder or legacy /Applications)
